@@ -1,0 +1,95 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Post {
+  id        String   @id @default(cuid())
+  title     String
+  content   String?
+  published Boolean  @default(false)
+  authorId  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ===== IoT Platform Models =====
+
+model Device {
+  id              String   @id @default(cuid())
+  name            String
+  macAddress       String   @unique
+  location        String   @default("Unknown")
+  firmwareVersion String   @default("1.0.0")
+  ipAddress       String   @default("0.0.0.0")
+
+  // Status
+  status          String   @default("offline") // online | offline
+  fanStatus       String   @default("off")     // on | off
+
+  // Latest telemetry (cached for fast dashboard load)
+  temperature     Float    @default(0)
+  humidity        Float    @default(0)
+  rssi            Int      @default(0)
+  uptimeSeconds   Int      @default(0)
+
+  // Connection info
+  lastSeenAt      DateTime @default(now())
+  registeredAt    DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  readings        SensorReading[]
+  commands        CommandLog[]
+
+  @@index([status])
+  @@index([fanStatus])
+}
+
+model SensorReading {
+  id          String   @id @default(cuid())
+  deviceId    String
+  temperature Float
+  humidity    Float
+  fanStatus   String   @default("off") // on | off
+  rssi        Int      @default(0)
+  uptimeSeconds Int    @default(0)
+  createdAt   DateTime @default(now())
+
+  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, createdAt])
+  @@index([createdAt])
+}
+
+model CommandLog {
+  id         String   @id @default(cuid())
+  deviceId   String
+  action     String   // on | off
+  status     String   @default("pending") // pending | sent | acknowledged | failed
+  source     String   @default("dashboard") // dashboard | schedule
+  error      String?
+  createdAt  DateTime @default(now())
+  sentAt     DateTime?
+  ackedAt    DateTime?
+
+  device     Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, createdAt])
+  @@index([status])
+}
