@@ -11,8 +11,10 @@ import {
   ChevronRight,
   Loader2,
   Power,
+  TriangleAlert,
   Wifi,
   WifiOff,
+  Flame,
 } from "lucide-react";
 import { formatDistanceToNowStrict } from "date-fns";
 import { Card } from "@/components/ui/card";
@@ -21,6 +23,8 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { toast } from "sonner";
 import { FanIcon } from "@/components/iot/fan-icon";
+import { ModeToggle } from "@/components/iot/mode-toggle";
+import { useFanAction } from "@/components/iot/use-fan-action";
 import type { DeviceDTO } from "@/lib/iot-contracts";
 import { cn } from "@/lib/utils";
 
@@ -84,46 +88,12 @@ function tempTone(t: number) {
 }
 
 export function DeviceCard({ device, onOpenDetails }: DeviceCardProps) {
-  const [pending, setPending] = useState<"on" | "off" | null>(null);
+  const { pending, send: handleFan } = useFanAction(device);
   const isOnline = device.status === "online";
   const fanOn = device.fanStatus === "on";
-
-  async function handleFan(action: "on" | "off") {
-    setPending(action);
-    try {
-      const res = await fetch(`/api/devices/${device.id}/fan`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.error || `HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      toast.success(
-        action === "on"
-          ? `Fan ON command sent for ${device.name}`
-          : `Fan OFF command sent for ${device.name}`,
-        {
-          description:
-            "Waiting for the device to acknowledge (watch the live feed).",
-        },
-      );
-      // Optimistically reflect the pending state until the WS ack lands.
-      if (data?.status && data.status !== "acknowledged") {
-        // The hub will broadcast a fan:state / command:ack soon.
-      }
-    } catch (e) {
-      const message =
-        e instanceof Error ? e.message : "Unknown error";
-      toast.error(`Failed to ${action === "on" ? "turn on" : "turn off"} fan`, {
-        description: message,
-      });
-    } finally {
-      setPending(null);
-    }
-  }
+  const isAuto = device.mode === "auto";
+  const manualOn = !isAuto && device.desiredFanStatus === "on";
+  const manualOff = !isAuto && device.desiredFanStatus === "off";
 
   return (
     <motion.div
@@ -147,6 +117,11 @@ export function DeviceCard({ device, onOpenDetails }: DeviceCardProps) {
               <MapPin className="size-3" />
               <span className="truncate">{device.location || "Unknown"}</span>
             </div>
+            <Badge variant="outline" className="mt-1.5 text-[10px] uppercase tracking-wide">
+              {isAuto
+                ? `Auto · ${device.tempOn}° on / ${device.tempOff}° off`
+                : `Manual · fan ${device.desiredFanStatus}`}
+            </Badge>
           </div>
           {isOnline ? (
             <Badge className="border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">
@@ -210,6 +185,16 @@ export function DeviceCard({ device, onOpenDetails }: DeviceCardProps) {
           </div>
         </div>
 
+        {!device.sensorOk && (
+          <div
+            role="alert"
+            className="mx-4 mb-3 flex items-center gap-2 rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-xs font-medium text-amber-700 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300"
+          >
+            <TriangleAlert className="size-3.5" />
+            Sensor error — showing last known reading
+          </div>
+        )}
+
         {/* Telemetry mini-grid */}
         <div className="grid grid-cols-3 gap-2 px-4 pb-3">
           <Telemetry
@@ -236,6 +221,16 @@ export function DeviceCard({ device, onOpenDetails }: DeviceCardProps) {
           />
         </div>
 
+        {device.gasLevel !== null && device.gasLevel !== undefined && (
+          <div className="px-4 pb-3">
+            <Telemetry
+              icon={<Flame className="size-3.5 text-amber-600" />}
+              label="Gas level"
+              value={String(device.gasLevel)}
+            />
+          </div>
+        )}
+
         {/* Last seen + command footer */}
         <div className="mt-auto border-t p-4">
           <div className="flex items-center justify-between text-xs text-muted-foreground">
@@ -260,17 +255,19 @@ export function DeviceCard({ device, onOpenDetails }: DeviceCardProps) {
             </Tooltip>
           </div>
 
-          <div className="mt-3 grid grid-cols-2 gap-2">
+          <ModeToggle device={device} className="mt-3" />
+
+          <div className="mt-2 grid grid-cols-2 gap-2">
             <Button
               type="button"
               variant="default"
               size="sm"
               className={cn(
                 "h-10 bg-emerald-600 text-white shadow-sm hover:bg-emerald-700",
-                (fanOn || !isOnline || pending === "on") &&
+                (manualOn || pending === "on") &&
                   "opacity-100 disabled:cursor-not-allowed disabled:opacity-50",
               )}
-              disabled={fanOn || !isOnline || pending !== null}
+              disabled={manualOn || pending !== null}
               onClick={() => handleFan("on")}
               aria-label={`Turn fan on for ${device.name}`}
             >
@@ -286,7 +283,7 @@ export function DeviceCard({ device, onOpenDetails }: DeviceCardProps) {
               variant="outline"
               size="sm"
               className="h-10"
-              disabled={!fanOn || !isOnline || pending !== null}
+              disabled={manualOff || pending !== null}
               onClick={() => handleFan("off")}
               aria-label={`Turn fan off for ${device.name}`}
             >

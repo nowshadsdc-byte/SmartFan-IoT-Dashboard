@@ -11,8 +11,8 @@ import { useIotStore } from "@/hooks/use-iot-store";
  * Establishes a socket.io connection to the IoT hub (port 3003) and
  * wires every broadcast event into the shared Zustand store.
  *
- * Connection URL uses the gateway's XTransformPort query param so Caddy
- * can route to the correct backend port without us hard-coding a host.
+ * Connects to the same origin on the default `/socket.io/` path; Caddy routes
+ * that path to the hub and injects the dashboard secret header.
  */
 export function useIotSocket() {
   const socketRef = useRef<Socket | null>(null);
@@ -21,7 +21,7 @@ export function useIotSocket() {
   useEffect(() => {
     setConnection("connecting");
 
-    const socket = io("/?XTransformPort=3003", {
+    const socket = io({
       transports: ["websocket", "polling"],
       reconnection: true,
       reconnectionAttempts: Infinity,
@@ -83,6 +83,12 @@ export function useIotSocket() {
     socket.on(IoTEvents.FanState, (payload: unknown) => {
       if (payload && typeof payload === "object") {
         useIotStore.getState().applyFanState(payload as never);
+      }
+    });
+
+    socket.on(IoTEvents.DeviceConfig, (payload: unknown) => {
+      if (payload && typeof payload === "object") {
+        useIotStore.getState().applyConfig(payload as never);
       }
     });
 
