@@ -1,23 +1,33 @@
-:81 {
-	@transform_port_query {
-		query XTransformPort=*
+# Single public entry point on port 5050 (Docker network: service names, never localhost).
+# Browser  -> basic auth, then /socket.io/* goes to the hub with the internal secret.
+# ESP8266  -> /socket.io/?token=<DEVICE_TOKEN> skips basic auth (it cannot send it) and goes to the
+#             hub WITHOUT the secret header; the hub checks the device token itself.
+{$SITE_ADDRESS} {
+	@device {
+		path /socket.io/*
+		query token=*
+	}
+	handle @device {
+		reverse_proxy iot-hub:3003 {
+			# never let a client smuggle in the dashboard secret
+			header_up -x-hub-secret
+		}
 	}
 
-	handle @transform_port_query {
-		reverse_proxy localhost:{query.XTransformPort} {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
+	handle /socket.io/* {
+		# Generate the hash with:  docker run --rm caddy:2-alpine caddy hash-password
+		basic_auth {
+			{$DASHBOARD_USER} {$DASHBOARD_PASSWORD_HASH}
+		}
+		reverse_proxy iot-hub:3003 {
+			header_up x-hub-secret {$HUB_INTERNAL_SECRET}
 		}
 	}
 
 	handle {
-		reverse_proxy localhost:3000 {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
+		basic_auth {
+			{$DASHBOARD_USER} {$DASHBOARD_PASSWORD_HASH}
 		}
+		reverse_proxy frontend:3000
 	}
 }

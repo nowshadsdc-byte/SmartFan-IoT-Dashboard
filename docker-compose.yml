@@ -1,15 +1,113 @@
+# All secrets/config come from .env (copy .env.example). See README.md → "Deploy to a VPS".
+
+x-db-env: &db-env
+  DATABASE_URL: file:/app/data/dev.db
+
 services:
+  # One-shot: create/update the SQLite tables before anything else starts.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrate
+    environment:
+      <<: *db-env
+    volumes:
+      - iot-data:/app/data
+    restart: "no"
+
   frontend:
     build:
       context: .
       dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
+    # Not published: only reachable by Caddy on the internal network.
+    expose:
+      - "3000"
     environment:
-      DATABASE_URL: file:/app/data/dev.db
+      <<: *db-env
+      IOT_HUB_URL: http://iot-hub:3003
+      HUB_INTERNAL_SECRET: ${HUB_INTERNAL_SECRET:?set HUB_INTERNAL_SECRET in .env (>= 16 chars)}
     volumes:
       - iot-data:/app/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/stats"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
+
+  iot-hub:
+    build:
+      context: .
+      dockerfile: mini-services/iot-hub/Dockerfile
+    # Not published: everything (browser + ESP8266) enters through Caddy on port 5050.
+    expose:
+      - "3003"
+    environment:
+      <<: *db-env
+      DEVICE_TOKEN: ${DEVICE_TOKEN:?set DEVICE_TOKEN in .env (>= 16 chars)}
+      HUB_INTERNAL_SECRET: ${HUB_INTERNAL_SECRET:?set HUB_INTERNAL_SECRET in .env (>= 16 chars)}
+      READING_RETENTION_DAYS: ${READING_RETENTION_DAYS:-30}
+    volumes:
+      - iot-data:/app/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3003/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # The only public entry (port 5050): web UI, REST API and device websocket. Basic auth + routing.
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "5050:5050"
+    environment:
+      SITE_ADDRESS: ":5050"
+      DASHBOARD_USER: ${DASHBOARD_USER:?set DASHBOARD_USER in .env}
+      DASHBOARD_PASSWORD_HASH: ${DASHBOARD_PASSWORD_HASH:?set DASHBOARD_PASSWORD_HASH in .env (caddy hash-password)}
+      HUB_INTERNAL_SECRET: ${HUB_INTERNAL_SECRET:?set HUB_INTERNAL_SECRET in .env (>= 16 chars)}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      frontend:
+        condition: service_healthy
+      iot-hub:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Dev only: `docker compose --profile dev up` — 4 simulated ESP8266 devices.
+  esp-simulator:
+    profiles: ["dev"]
+    image: oven/bun:1.3.6-alpine
+    working_dir: /app
+    command: ["sh", "-c", "bun install && bun index.ts"]
+    environment:
+      HUB_URL: http://iot-hub:3003
+      DEVICE_TOKEN: ${DEVICE_TOKEN:-}
+    volumes:
+      - ./mini-services/esp-simulator:/app
+    depends_on:
+      iot-hub:
+        condition: service_healthy
 
 volumes:
   iot-data:
+  caddy-data:
+  caddy-config:

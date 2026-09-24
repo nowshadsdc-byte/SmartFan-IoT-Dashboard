@@ -1,10 +1,11 @@
 // ESP8266 Device Simulator — Smart Fan Monitoring platform
 //
-// Spawns 4 simulated ESP8266 devices, each a socket.io-client that connects
-// directly to the local IoT hub (server-to-server, NOT through Caddy).
-// Each device registers itself, then sends telemetry every 5s. It listens
-// for `fan:command` events and acks them. While a fan is ON, the simulated
-// temperature drops slowly toward a floor; while OFF, drifts back toward base.
+// Spawns 4 simulated ESP8266 devices that speak the SAME protocol as the real firmware:
+// websocket-only Socket.IO, device token in the query string, register → device:config →
+// telemetry every heartbeatIntervalSec, fan:command + command:ack, and local auto-mode
+// control with hysteresis. Dev/test client only — production runs no simulator.
+//
+// Env: HUB_URL (default http://localhost:3003), DEVICE_TOKEN (required).
 //
 // Every ~90s, one random device goes offline for 15s to demonstrate
 // online/offline transitions.
@@ -12,8 +13,12 @@
 import { io, Socket } from "socket.io-client";
 import { createServer } from "http";
 
-const HUB_URL = "http://localhost:3003";
-const SOCKET_PATH = "/";
+const HUB_URL = process.env.HUB_URL ?? "http://localhost:3003";
+const DEVICE_TOKEN = process.env.DEVICE_TOKEN ?? "";
+if (!DEVICE_TOKEN) {
+  console.error("[sim] DEVICE_TOKEN env var is required");
+  process.exit(1);
+}
 
 // ---------------------------------------------------------------------------
 // Device definitions
@@ -73,18 +78,25 @@ const DEVICE_CONFIGS: DeviceConfig[] = [
 // ---------------------------------------------------------------------------
 
 type FanStatus = "on" | "off";
+type Mode = "auto" | "manual";
 
 interface SimulatedDevice {
   config: DeviceConfig;
   socket: Socket | null;
   deviceId: string | null; // assigned by the hub on register
+  // server-owned config, received via device:config
+  mode: Mode;
+  desiredFanStatus: FanStatus;
+  tempOn: number;
+  tempOff: number;
+  heartbeatIntervalSec: number;
+  // actual state
   fanStatus: FanStatus;
   temperature: number;
   humidity: number;
   rssi: number;
   uptimeSeconds: number;
-  lastTelemetryAt: number;
-  registerSeq: number; // incremented each time we register
+  registerSeq: number; // incremented each time we connect
   intentionallyOffline: boolean; // when simulating a brief outage
   telemetryTimer: ReturnType<typeof setInterval> | null;
 }
@@ -94,12 +106,16 @@ function createSimulatedDevice(config: DeviceConfig): SimulatedDevice {
     config,
     socket: null,
     deviceId: null,
+    mode: "auto",
+    desiredFanStatus: "off",
+    tempOn: 32,
+    tempOff: 30,
+    heartbeatIntervalSec: 10,
     fanStatus: "off",
     temperature: config.baseTemperature,
     humidity: config.baseHumidity,
     rssi: -55,
     uptimeSeconds: 0,
-    lastTelemetryAt: 0,
     registerSeq: 0,
     intentionallyOffline: false,
     telemetryTimer: null,
@@ -126,45 +142,34 @@ function randomRssi() {
   return -Math.floor(40 + Math.random() * 35);
 }
 
-function makeCommandId() {
-  // unique enough
-  return (
-    Date.now().toString(36) +
-    "-" +
-    Math.random().toString(36).slice(2, 8)
-  );
+// ---------------------------------------------------------------------------
+// Physics + on-device control logic
+// ---------------------------------------------------------------------------
+
+/** What the firmware does on its own: manual → follow desired state, auto → thresholds with hysteresis. */
+function applyControl(d: SimulatedDevice) {
+  if (d.mode === "manual") {
+    d.fanStatus = d.desiredFanStatus;
+  } else if (d.temperature >= d.tempOn) {
+    d.fanStatus = "on";
+  } else if (d.temperature <= d.tempOff) {
+    d.fanStatus = "off";
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Telemetry computation
-// ---------------------------------------------------------------------------
-
-function stepTelemetry(d: SimulatedDevice) {
-  // Cooling effect when fan is ON; drift toward base when OFF
-  if (d.fanStatus === "on") {
-    // cool down toward floor (base - 4°C)
-    const floor = d.config.baseTemperature - 4;
-    if (d.temperature > floor) {
-      d.temperature = clamp(d.temperature - 0.3, floor, 40);
-    }
-  } else {
-    // drift back toward base
-    if (d.temperature < d.config.baseTemperature) {
-      d.temperature = clamp(d.temperature + 0.2, 10, d.config.baseTemperature + 1);
-    } else if (d.temperature > d.config.baseTemperature) {
-      d.temperature = clamp(d.temperature - 0.1, d.config.baseTemperature - 1, 40);
-    }
-  }
-  // small random walk on top
-  d.temperature = clamp(randomWalk(d.temperature, 0.5, 10, 40), 10, 40);
-  // humidity drift
+function stepTelemetry(d: SimulatedDevice, dtSec: number) {
+  // The room warms toward ambient (base + 5°C); a running fan cools it ~0.1°C/s.
+  const ambient = d.config.baseTemperature + 5;
+  const drift = d.fanStatus === "on" ? -0.1 * dtSec : Math.sign(ambient - d.temperature) * 0.05 * dtSec;
+  d.temperature = clamp(randomWalk(d.temperature + drift, 0.3, 10, 45), 10, 45);
   d.humidity = clamp(randomWalk(d.humidity, 2, 20, 90), 20, 90);
   d.rssi = randomRssi();
-  d.uptimeSeconds += 5;
+  d.uptimeSeconds += dtSec;
+  applyControl(d);
 }
 
 // ---------------------------------------------------------------------------
-// Connection lifecycle
+// Socket connection (mirrors the real ESP8266 firmware)
 // ---------------------------------------------------------------------------
 
 function connectDevice(d: SimulatedDevice) {
@@ -177,8 +182,9 @@ function connectDevice(d: SimulatedDevice) {
     d.socket = null;
   }
 
+  // websocket only, token in the query string — exactly like arduinoWebSockets SocketIOclient
   const socket = io(HUB_URL, {
-    path: SOCKET_PATH,
+    query: { token: DEVICE_TOKEN },
     reconnection: true,
     reconnectionAttempts: Infinity,
     reconnectionDelay: 1000,
@@ -192,62 +198,63 @@ function connectDevice(d: SimulatedDevice) {
 
   socket.on("connect", () => {
     console.log(`[sim] ${d.config.name} connected (socket=${socket.id})`);
-    // Register device
-    const payload = {
-      deviceId: d.deviceId ?? d.config.macAddress, // hub will return the real id
-      name: d.config.name,
+    socket.emit("device:register", {
       macAddress: d.config.macAddress,
+      name: d.config.name,
       location: d.config.location,
       firmwareVersion: d.config.firmwareVersion,
       ipAddress: d.config.ipAddress,
-    };
-    socket.emit("device:register", payload);
+    });
   });
 
   socket.on("device:register", (ack: any) => {
-    // Guard against late events from a previous socket instance
     if (mySeq !== d.registerSeq) return;
     if (ack && ack.ok && ack.deviceId) {
       d.deviceId = ack.deviceId;
       console.log(`[sim] ${d.config.name} registered as deviceId=${d.deviceId}`);
-      // start telemetry timer
-      if (d.telemetryTimer) clearInterval(d.telemetryTimer);
-      // send one immediately
-      sendTelemetry(d);
-      d.telemetryTimer = setInterval(() => sendTelemetry(d), 5000);
     }
   });
 
-  socket.on("fan:state", (payload: any) => {
-    if (mySeq !== d.registerSeq) return;
-    if (payload && payload.deviceId === d.deviceId && payload.fanStatus) {
-      // sync local state with hub's desired state (e.g., on reconnect)
-      if (d.fanStatus !== payload.fanStatus) {
-        d.fanStatus = payload.fanStatus;
-        console.log(
-          `[sim] ${d.config.name} fan synced from hub: ${payload.fanStatus}`
-        );
-      }
-    }
+  // Server-owned config: mode, desired fan state, thresholds, heartbeat interval.
+  socket.on("device:config", (cfg: any) => {
+    if (mySeq !== d.registerSeq || !cfg || cfg.deviceId !== d.deviceId) return;
+    d.mode = cfg.mode === "manual" ? "manual" : "auto";
+    d.desiredFanStatus = cfg.desiredFanStatus === "on" ? "on" : "off";
+    d.tempOn = cfg.tempOn;
+    d.tempOff = cfg.tempOff;
+    const intervalChanged = d.heartbeatIntervalSec !== cfg.heartbeatIntervalSec || !d.telemetryTimer;
+    d.heartbeatIntervalSec = cfg.heartbeatIntervalSec;
+    console.log(
+      `[sim] ${d.config.name} config: mode=${d.mode} desired=${d.desiredFanStatus} on>=${d.tempOn} off<=${d.tempOff} hb=${d.heartbeatIntervalSec}s`
+    );
+    applyControl(d);
+    if (intervalChanged) startTelemetry(d);
   });
+
+  // Legacy event, ignored by this firmware: device:config carries everything.
+  socket.on("fan:state", () => {});
 
   socket.on("fan:command", (payload: any) => {
-    if (mySeq !== d.registerSeq) return;
-    if (!payload) return;
-    // Update local fan state
-    d.fanStatus = payload.action === "on" ? "on" : "off";
+    if (mySeq !== d.registerSeq || !payload) return;
+    if (payload.action === "auto") {
+      d.mode = "auto";
+    } else if (payload.action === "on" || payload.action === "off") {
+      d.mode = "manual";
+      d.desiredFanStatus = payload.action;
+    } else {
+      return;
+    }
+    applyControl(d);
     console.log(
       `[sim] ${d.config.name} received fan:command action=${payload.action} cmd=${payload.commandId}`
     );
-    // Ack
-    const ack = {
+    socket.emit("command:ack", {
       commandId: payload.commandId,
       deviceId: d.deviceId,
       success: true,
       fanStatus: d.fanStatus,
-      timestamp: new Date().toISOString(),
-    };
-    socket.emit("command:ack", ack);
+      mode: d.mode,
+    });
   });
 
   socket.on("disconnect", (reason: string) => {
@@ -259,26 +266,31 @@ function connectDevice(d: SimulatedDevice) {
   });
 
   socket.on("connect_error", (err: Error) => {
-    // quiet log to avoid spam during hub restarts
     console.warn(`[sim] ${d.config.name} connect_error: ${err.message}`);
   });
+}
+
+function startTelemetry(d: SimulatedDevice) {
+  if (d.telemetryTimer) clearInterval(d.telemetryTimer);
+  sendTelemetry(d);
+  d.telemetryTimer = setInterval(() => sendTelemetry(d), d.heartbeatIntervalSec * 1000);
 }
 
 function sendTelemetry(d: SimulatedDevice) {
   if (!d.socket || !d.socket.connected || !d.deviceId) return;
   if (d.intentionallyOffline) return;
-  stepTelemetry(d);
-  const payload = {
+  stepTelemetry(d, d.heartbeatIntervalSec);
+  d.socket.emit("telemetry", {
     deviceId: d.deviceId,
     temperature: parseFloat(d.temperature.toFixed(2)),
     humidity: parseFloat(d.humidity.toFixed(1)),
     fanStatus: d.fanStatus,
+    mode: d.mode,
+    sensorOk: true,
+    gasLevel: null,
     rssi: d.rssi,
-    uptimeSeconds: d.uptimeSeconds,
-    timestamp: new Date().toISOString(),
-  };
-  d.lastTelemetryAt = Date.now();
-  d.socket.emit("telemetry", payload);
+    uptimeSeconds: Math.floor(d.uptimeSeconds),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +340,7 @@ const healthServer = createServer((_req, res) => {
     deviceId: d.deviceId,
     connected: !!(d.socket && d.socket.connected),
     fanStatus: d.fanStatus,
+    mode: d.mode,
     temperature: parseFloat(d.temperature.toFixed(2)),
     humidity: parseFloat(d.humidity.toFixed(1)),
     rssi: d.rssi,
