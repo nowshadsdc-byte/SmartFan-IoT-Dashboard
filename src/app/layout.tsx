@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SmartFan IoT — Monitoring & Remote Control",
+  title: "SmartFan IoT Dashboard",
   description: "Web-based IoT platform for monitoring ESP8266-connected smart fans: real-time temperature & humidity, online/offline status, fan ON/OFF remote control, sensor history, and device health.",
   keywords: ["IoT", "Smart Fan", "ESP8266", "Monitoring", "Remote Control", "Temperature", "Humidity", "Next.js", "Dashboard"],
   authors: [{ name: "SmartFan IoT" }],
@@ -22,14 +22,14 @@ export const metadata: Metadata = {
     icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
   },
   openGraph: {
-    title: "SmartFan IoT — Monitoring & Remote Control",
+    title: "SmartFan IoT Dashboard",
     description: "Real-time IoT dashboard for smart fan monitoring and remote control via ESP8266.",
     siteName: "SmartFan IoT",
     type: "website",
   },
   twitter: {
     card: "summary_large_image",
-    title: "SmartFan IoT",
+    title: "SmartFan IoT Dashboard",
     description: "Real-time IoT dashboard for smart fan monitoring and remote control via ESP8266.",
   },
 };

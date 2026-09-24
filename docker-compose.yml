@@ -1,0 +1,15 @@
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: file:/app/data/dev.db
+    volumes:
+      - iot-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  iot-data:

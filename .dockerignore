@@ -1,0 +1,12 @@
+node_modules
+.next
+dev.log
+server.log
+.git
+.gitignore
+Dockerfile
+docker-compose.yml
+*.log
+screenshots
+download
+agent-ctx
