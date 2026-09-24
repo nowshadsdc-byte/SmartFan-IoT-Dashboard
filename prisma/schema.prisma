@@ -40,13 +40,22 @@ model Device {
 
   // Status
   status          String   @default("offline") // online | offline
-  fanStatus       String   @default("off")     // on | off
+  fanStatus       String   @default("off")     // on | off — ACTUAL state reported by the device
+
+  // Server-owned control config (never overwritten by telemetry)
+  mode             String  @default("auto")    // auto | manual
+  desiredFanStatus String  @default("off")     // on | off — what the user asked for in manual mode
+  tempOn           Float   @default(32)        // fan on at or above (°C)
+  tempOff          Float   @default(30)        // fan off at or below (°C)
+  heartbeatIntervalSec Int @default(10)
 
   // Latest telemetry (cached for fast dashboard load)
   temperature     Float    @default(0)
   humidity        Float    @default(0)
   rssi            Int      @default(0)
   uptimeSeconds   Int      @default(0)
+  gasLevel        Int?                         // optional MQ-5 gas sensor
+  sensorOk        Boolean  @default(true)
 
   // Connection info
   lastSeenAt      DateTime @default(now())
@@ -69,6 +78,7 @@ model SensorReading {
   fanStatus   String   @default("off") // on | off
   rssi        Int      @default(0)
   uptimeSeconds Int    @default(0)
+  gasLevel    Int?
   createdAt   DateTime @default(now())
 
   device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
@@ -80,8 +90,8 @@ model SensorReading {
 model CommandLog {
   id         String   @id @default(cuid())
   deviceId   String
-  action     String   // on | off
-  status     String   @default("pending") // pending | sent | acknowledged | failed
+  action     String   // on | off | auto
+  status     String   @default("queued") // queued | sent | acknowledged | failed
   source     String   @default("dashboard") // dashboard | schedule
   error      String?
   createdAt  DateTime @default(now())
