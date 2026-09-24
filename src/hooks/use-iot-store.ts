@@ -8,6 +8,7 @@ import type {
   FanStatePayload,
   SnapshotPayload,
   CommandAckPayload,
+  DeviceConfigPayload,
 } from "@/lib/iot-contracts";
 
 /**
@@ -48,6 +49,7 @@ interface IotState {
   applyDeviceStatus: (payload: DeviceStatusPayload) => void;
   applyFanState: (payload: FanStatePayload) => void;
   applyCommandAck: (payload: CommandAckPayload) => void;
+  applyConfig: (payload: DeviceConfigPayload) => void;
   setStats: (stats: DashboardStats | null) => void;
   setConnection: (state: ConnectionState) => void;
   setLoading: (loading: boolean) => void;
@@ -65,17 +67,22 @@ function mergeTelemetryIntoDevice(
   device: DeviceDTO,
   t: TelemetryPayload,
 ): DeviceDTO {
+  const ts = t.timestamp ?? new Date().toISOString();
   return {
     ...device,
-    temperature: t.temperature,
-    humidity: t.humidity,
+    // null = sensor error: keep the last good reading.
+    temperature: t.temperature ?? device.temperature,
+    humidity: t.humidity ?? device.humidity,
     fanStatus: t.fanStatus,
     rssi: t.rssi,
     uptimeSeconds: t.uptimeSeconds,
+    gasLevel: t.gasLevel ?? null,
+    sensorOk: t.sensorOk ?? true,
+    // mode / desiredFanStatus / thresholds are server-owned: never taken from telemetry.
     // Telemetry implies the device is reachable.
     status: "online",
-    lastSeenAt: t.timestamp,
-    updatedAt: t.timestamp,
+    lastSeenAt: ts,
+    updatedAt: ts,
   };
 }
 
@@ -149,11 +156,27 @@ export const useIotStore = create<IotState>((set, get) => ({
       fanStatus: payload.fanStatus,
       // A successful ack means the device responded → it's online.
       status: payload.success ? "online" : next[idx].status,
-      lastSeenAt: payload.timestamp,
-      updatedAt: payload.timestamp,
+      lastSeenAt: payload.timestamp ?? next[idx].lastSeenAt,
+      updatedAt: payload.timestamp ?? next[idx].updatedAt,
     };
     set({ devices: next, lastEventAt: Date.now() });
     get().recomputeStats();
+  },
+
+  applyConfig: (payload) => {
+    const devices = get().devices;
+    const idx = devices.findIndex((d) => d.id === payload.deviceId);
+    if (idx === -1) return;
+    const next = devices.slice();
+    next[idx] = {
+      ...next[idx],
+      mode: payload.mode,
+      desiredFanStatus: payload.desiredFanStatus,
+      tempOn: payload.tempOn,
+      tempOff: payload.tempOff,
+      heartbeatIntervalSec: payload.heartbeatIntervalSec,
+    };
+    set({ devices: next });
   },
 
   setStats: (stats) => set({ stats }),

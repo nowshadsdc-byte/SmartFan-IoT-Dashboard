@@ -1,9 +1,13 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { toCommandLogDTO, forwardFanCommand } from "@/lib/iot-hub-client";
+import { forwardFanCommand } from "@/lib/iot-hub-client";
 
-// POST /api/devices/[id]/fan — turn fan ON or OFF
-// Body: { action: "on" | "off" }
+// POST /api/devices/[id]/fan — control the fan
+// Body: { action: "on" | "off" | "auto" }
+//  - on/off → mode = "manual", desiredFanStatus = action
+//  - auto   → mode = "auto"
+// The change is persisted FIRST, so it survives an offline device or hub.
+// 200 = delivered to the online device, 202 = queued (device or hub offline).
 
 export async function POST(
   req: Request,
@@ -12,11 +16,10 @@ export async function POST(
   try {
     const { id } = await params;
 
-    // Parse body
-    let action: "on" | "off" | null = null;
+    let action: "on" | "off" | "auto" | null = null;
     try {
       const body = await req.json();
-      if (body?.action === "on" || body?.action === "off") {
+      if (body?.action === "on" || body?.action === "off" || body?.action === "auto") {
         action = body.action;
       }
     } catch {
@@ -24,65 +27,47 @@ export async function POST(
     }
     if (!action) {
       return NextResponse.json(
-        { error: "invalid_action", message: 'action must be "on" or "off"' },
+        { error: "invalid_action", message: 'action must be "on", "off" or "auto"' },
         { status: 400 }
       );
     }
 
-    // Validate device exists
-    const device = await db.device.findUnique({ where: { id } });
+    const device = await db.device.findUnique({ where: { id }, select: { id: true } });
     if (!device) {
       return NextResponse.json({ error: "device_not_found" }, { status: 404 });
     }
 
-    const commandId = crypto.randomUUID();
-    const now = new Date();
+    // Persist desired state + command log in one transaction (exactly one CommandLog row).
+    const [updated, command] = await db.$transaction([
+      db.device.update({
+        where: { id },
+        data:
+          action === "auto"
+            ? { mode: "auto" }
+            : { mode: "manual", desiredFanStatus: action },
+      }),
+      db.commandLog.create({
+        data: { deviceId: id, action, status: "queued", source: "dashboard" },
+      }),
+    ]);
 
-    // Create pending command log
-    const command = await db.commandLog.create({
-      data: {
+    // The hub updates this same row (queued → sent → acknowledged|failed).
+    const result = await forwardFanCommand({ deviceId: id, action, commandId: command.id });
+    const status = result.ok ? (result.status ?? "queued") : "queued";
+
+    return NextResponse.json(
+      {
+        commandId: command.id,
         deviceId: id,
         action,
-        status: "pending",
-        source: "dashboard",
+        status,
+        mode: updated.mode,
+        desiredFanStatus: updated.desiredFanStatus,
+        createdAt: command.createdAt.toISOString(),
+        ...(result.ok ? {} : { warning: result.error ?? "hub unreachable" }),
       },
-    });
-
-    // Forward to hub (fire-and-forget with timeout)
-    const result = await forwardFanCommand({ deviceId: id, action, commandId });
-
-    if (!result.ok) {
-      // Mark failed
-      const updated = await db.commandLog.update({
-        where: { id: command.id },
-        data: { status: "failed", error: result.error ?? "hub unreachable" },
-      });
-      return NextResponse.json(
-        {
-          commandId,
-          deviceId: id,
-          action,
-          status: "failed",
-          error: result.error ?? "hub unreachable",
-          createdAt: updated.createdAt.toISOString(),
-        },
-        { status: 503 }
-      );
-    }
-
-    // Mark sent
-    const updated = await db.commandLog.update({
-      where: { id: command.id },
-      data: { status: "sent", sentAt: now },
-    });
-
-    return NextResponse.json({
-      commandId,
-      deviceId: id,
-      action,
-      status: "sent",
-      createdAt: updated.createdAt.toISOString(),
-    });
+      { status: status === "sent" ? 200 : 202 }
+    );
   } catch (err) {
     console.error("[POST /api/devices/[id]/fan] error:", err);
     return NextResponse.json({ error: "internal_error" }, { status: 500 });

@@ -10,3 +10,10 @@ docker-compose.yml
 screenshots
 download
 agent-ctx
+**/node_modules
+.env
+.env.*
+db
+screenshots
+mini-services/esp-simulator
+scripts

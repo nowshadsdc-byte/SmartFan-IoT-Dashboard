@@ -11,6 +11,7 @@ import {
   ShieldCheck,
   ShieldAlert,
   ShieldX,
+  TriangleAlert,
   Wrench,
 } from "lucide-react";
 import {
@@ -32,6 +33,8 @@ import {
 } from "@/components/ui/table";
 import { HistoryChart } from "@/components/iot/history-chart";
 import { FanIcon } from "@/components/iot/fan-icon";
+import { ModeToggle } from "@/components/iot/mode-toggle";
+import { ConfigForm } from "@/components/iot/config-form";
 import { useIotStore } from "@/hooks/use-iot-store";
 import type {
   CommandLogDTO,
@@ -123,7 +126,7 @@ function commandStatusTone(status: string): string {
   switch (status) {
     case "acknowledged":
       return "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300";
-    case "pending":
+    case "queued":
       return "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300";
     case "failed":
       return "border-rose-300 bg-rose-50 text-rose-700 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-300";
@@ -255,6 +258,32 @@ export function DeviceDetailDialog({
                 </div>
               </div>
 
+              {!device.sensorOk && (
+                <div
+                  role="alert"
+                  className="flex items-center gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-700 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300"
+                >
+                  <TriangleAlert className="size-4" />
+                  Sensor error — the device reports its temperature/humidity sensor is failing.
+                </div>
+              )}
+
+              {/* Control mode + settings */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <h3 className="text-sm font-semibold">Control mode</h3>
+                  <ModeToggle device={device} className="w-56" />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {device.mode === "auto"
+                    ? `Auto: the device turns the fan on at ≥ ${device.tempOn} °C and off at ≤ ${device.tempOff} °C.`
+                    : `Manual: the fan is held ${device.desiredFanStatus.toUpperCase()} until you switch back to Auto.`}
+                </p>
+                <ConfigForm device={device} />
+              </div>
+
+              <Separator />
+
               {/* Info grid */}
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-2">
                 <InfoRow
@@ -301,6 +330,9 @@ export function DeviceDetailDialog({
                     health?.uptimeSeconds ?? device.uptimeSeconds ?? 0,
                   )}
                 />
+                {device.gasLevel !== null && device.gasLevel !== undefined && (
+                  <InfoRow icon={Activity} label="Gas level" value={device.gasLevel} />
+                )}
                 <InfoRow
                   icon={Activity}
                   label="Readings (1h)"
