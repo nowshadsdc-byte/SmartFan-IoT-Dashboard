@@ -1,18 +1,21 @@
 // Helpers for Next.js API routes:
 // - DTO mappers (Device/SensorReading/CommandLog -> ISO-string DTOs)
-// - forwardFanCommand: fire-and-forget delivery of fan command to IoT hub via socket.io-client
+// - forwardFanCommand / notifyConfigUpdate: short-lived socket.io-client calls into the IoT hub
 
 import { io } from "socket.io-client";
 import type {
   CommandLogDTO,
   DeviceDTO,
+  DeviceConfigUpdatePayload,
+  DeviceMode,
   FanCommandPayload,
   FanStatus,
+  HubAck,
   SensorReadingDTO,
 } from "@/lib/iot-contracts";
 import { IoTEvents } from "@/lib/iot-contracts";
 
-const HUB_URL = "http://localhost:3003";
+const HUB_URL = process.env.IOT_HUB_URL || "http://localhost:3003";
 
 // ---- DTO mappers ----------------------------------------------------------
 
@@ -25,10 +28,17 @@ type DeviceRow = {
   ipAddress: string;
   status: string;
   fanStatus: string;
+  mode: string;
+  desiredFanStatus: string;
+  tempOn: number;
+  tempOff: number;
+  heartbeatIntervalSec: number;
   temperature: number;
   humidity: number;
   rssi: number;
   uptimeSeconds: number;
+  gasLevel: number | null;
+  sensorOk: boolean;
   lastSeenAt: Date;
   registeredAt: Date;
   createdAt: Date;
@@ -43,6 +53,7 @@ type ReadingRow = {
   fanStatus: string;
   rssi: number;
   uptimeSeconds: number;
+  gasLevel: number | null;
   createdAt: Date;
 };
 
@@ -68,10 +79,17 @@ export function toDeviceDTO(d: DeviceRow): DeviceDTO {
     ipAddress: d.ipAddress,
     status: (d.status === "online" ? "online" : "offline") as DeviceDTO["status"],
     fanStatus: (d.fanStatus === "on" ? "on" : "off") as FanStatus,
+    mode: (d.mode === "manual" ? "manual" : "auto") as DeviceMode,
+    desiredFanStatus: (d.desiredFanStatus === "on" ? "on" : "off") as FanStatus,
+    tempOn: d.tempOn,
+    tempOff: d.tempOff,
+    heartbeatIntervalSec: d.heartbeatIntervalSec,
     temperature: d.temperature,
     humidity: d.humidity,
     rssi: d.rssi,
     uptimeSeconds: d.uptimeSeconds,
+    gasLevel: d.gasLevel ?? null,
+    sensorOk: d.sensorOk,
     lastSeenAt: d.lastSeenAt.toISOString(),
     registeredAt: d.registeredAt.toISOString(),
     updatedAt: d.updatedAt.toISOString(),
@@ -87,6 +105,7 @@ export function toSensorReadingDTO(r: ReadingRow): SensorReadingDTO {
     fanStatus: (r.fanStatus === "on" ? "on" : "off") as FanStatus,
     rssi: r.rssi,
     uptimeSeconds: r.uptimeSeconds,
+    gasLevel: r.gasLevel ?? null,
     createdAt: r.createdAt.toISOString(),
   };
 }
@@ -95,7 +114,7 @@ export function toCommandLogDTO(c: CommandRow): CommandLogDTO {
   return {
     id: c.id,
     deviceId: c.deviceId,
-    action: (c.action === "on" ? "on" : "off") as "on" | "off",
+    action: (c.action === "on" || c.action === "auto" ? c.action : "off") as CommandLogDTO["action"],
     status: c.status as CommandLogDTO["status"],
     source: c.source,
     error: c.error,
@@ -105,31 +124,33 @@ export function toCommandLogDTO(c: CommandRow): CommandLogDTO {
   };
 }
 
-// ---- Hub forwarding -------------------------------------------------------
+// ---- Hub calls --------------------------------------------------------------
 
 export interface ForwardResult {
   ok: boolean;
+  /** Present when ok: "sent" if delivered to an online device, "queued" if the device is offline. */
+  status?: "sent" | "queued";
   error?: string;
 }
 
+/** Hard cap for any hub call — hub-unreachable is a normal, handled case. */
+const HUB_TIMEOUT_MS = 800;
+
 /**
- * Fire-and-forget delivery of a fan command to the IoT hub (port 3003).
- * Connects via socket.io-client (path "/"), emits the `fan:command` event,
- * then disconnects. Resolves within ~800ms regardless of outcome so the
- * API stays responsive.
+ * Emit one event to the hub over a short-lived socket and resolve with the
+ * hub's acknowledgement. Authenticates as a dashboard via the shared
+ * `x-hub-secret` header. Resolves within ~800ms regardless of outcome.
  */
-export function forwardFanCommand(payload: FanCommandPayload): Promise<ForwardResult> {
+function callHub(event: string, payload: unknown): Promise<ForwardResult> {
   return new Promise<ForwardResult>((resolve) => {
     let settled = false;
     let socket: ReturnType<typeof io> | null = null;
     let failTimer: ReturnType<typeof setTimeout> | null = null;
-    let disconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const finish = (result: ForwardResult) => {
       if (settled) return;
       settled = true;
       if (failTimer) clearTimeout(failTimer);
-      if (disconnectTimer) clearTimeout(disconnectTimer);
       try {
         socket?.disconnect();
       } catch {
@@ -140,32 +161,44 @@ export function forwardFanCommand(payload: FanCommandPayload): Promise<ForwardRe
 
     try {
       socket = io(HUB_URL, {
-        path: "/",
         reconnection: false,
-        timeout: 800,
+        timeout: HUB_TIMEOUT_MS,
         transports: ["websocket"],
         forceNew: true,
+        extraHeaders: { "x-hub-secret": process.env.HUB_INTERNAL_SECRET ?? "" },
       });
     } catch {
       finish({ ok: false, error: "hub unreachable" });
       return;
     }
 
-    // Hard timeout — never block the API longer than 800ms.
-    failTimer = setTimeout(() => finish({ ok: false, error: "hub unreachable" }), 800);
+    failTimer = setTimeout(() => finish({ ok: false, error: "hub unreachable" }), HUB_TIMEOUT_MS);
 
     socket.on("connect", () => {
       try {
-        socket?.emit(IoTEvents.FanCommand, payload);
+        socket?.emit(event, payload, (ack: HubAck | undefined) => {
+          if (ack?.ok) finish({ ok: true, status: ack.status === "sent" ? "sent" : "queued" });
+          else finish({ ok: false, error: ack?.error ?? "hub rejected the request" });
+        });
       } catch {
         finish({ ok: false, error: "emit failed" });
-        return;
       }
-      // Give the hub a brief moment to process the emit before disconnecting.
-      disconnectTimer = setTimeout(() => finish({ ok: true }), 500);
     });
 
     socket.on("connect_error", () => finish({ ok: false, error: "hub unreachable" }));
     socket.on("error", () => finish({ ok: false, error: "hub unreachable" }));
   });
+}
+
+/**
+ * Deliver a fan command (`on` | `off` | `auto`) to the hub. The DB row
+ * (`commandId`) must already exist; the hub updates its status.
+ */
+export function forwardFanCommand(payload: FanCommandPayload): Promise<ForwardResult> {
+  return callHub(IoTEvents.FanCommand, payload);
+}
+
+/** Tell the hub a device's config changed in the DB so it can push `device:config`. */
+export function notifyConfigUpdate(payload: DeviceConfigUpdatePayload): Promise<ForwardResult> {
+  return callHub(IoTEvents.DeviceConfigUpdate, payload);
 }
