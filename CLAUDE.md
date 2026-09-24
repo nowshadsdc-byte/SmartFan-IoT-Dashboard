@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 SmartFan IoT — a monitoring & remote-control dashboard for ESP8266-attached fans. A Next.js 16 app (single dashboard page) backed by Prisma/SQLite, plus two standalone Bun mini-services that simulate the IoT side (a WebSocket hub and a fleet of simulated ESP8266 devices). The package name (`nextjs_tailwind_shadcn_ts`) and `.zscripts/`/`tests/` build tooling are leftovers from the original scaffold template this project was generated from — the actual application is the IoT platform described below.
 
+## Device control model
+
+`Device` carries server-owned config (`mode` auto|manual, `desiredFanStatus`, `tempOn`/`tempOff`, `heartbeatIntervalSec`) that telemetry never overwrites; `fanStatus` is the device's actual state. The hub pushes it to devices as `device:config` (and to dashboards). Commands go `queued → sent → acknowledged|failed` (30s no-ack timeout); the API creates the `CommandLog` row and the hub updates that same row. Config validation lives in `src/lib/config-validation.ts` (mirrored in the hub). `scripts/fake-device.ts` emulates the real ESP8266 firmware.
+
 ## Commands
 
 Run from the repo root with `bun`:
@@ -26,11 +30,12 @@ There is no application test suite. `tests/*.sh` only test the `.zscripts/` bash
 Each lives under `mini-services/<name>/` with its own `package.json` (dev script `bun --hot index.ts`):
 
 ```bash
+# hub needs DEVICE_TOKEN + HUB_INTERNAL_SECRET (>=16 chars) and DATABASE_URL; simulator needs DEVICE_TOKEN
 cd mini-services/iot-hub && bun install && bun run dev        # WebSocket hub, port 3003
 cd mini-services/esp-simulator && bun install && bun run dev  # simulated devices, port 3004
 ```
 
-Without the hub running, the Next.js app still serves the dashboard and REST API against whatever is already in the DB, but degrades gracefully (WS shows "RECONNECTING", fan commands return 503 `hub unreachable`). Without the simulator, no new telemetry/devices are produced — the hub just has nothing registering.
+Without the hub running, the Next.js app still serves the dashboard and REST API against whatever is already in the DB, but degrades gracefully (WS shows "RECONNECTING", fan commands are persisted and return 202 `queued`). Without the simulator, no new telemetry/devices are produced — the hub just has nothing registering.
 
 `.zscripts/dev.sh` / `.zscripts/start.sh` / `.zscripts/mini-services-*.sh` automate installing + starting Next.js and every `mini-services/*` subfolder together, but assume a Linux sandbox layout (hardcoded `/home/z/my-project`, `/app/...` paths, Chinese-language logging) from the original deployment scaffold — treat them as reference/CI tooling, not the normal local dev path on this machine.
 
@@ -50,13 +55,16 @@ IoT hub (mini-services/iot-hub, :3003)  ── Prisma ──▶  SQLite (db/cust
 Next.js dashboard (src/app/page.tsx, :3000)
         │  REST: GET /api/devices, /api/devices/[id], /api/devices/[id]/history,
         │        /api/devices/[id]/health, /api/devices/[id]/commands, /api/stats
-        │  POST /api/devices/[id]/fan  →  forwardFanCommand() fire-and-forget
-        │        socket.io call into the hub (800ms hard timeout, never blocks longer)
+        │  POST /api/devices/[id]/fan, PUT /api/devices/[id]/config → persist to DB first,
+        │        then forwardFanCommand()/notifyConfigUpdate() socket.io calls into the hub
+        │        (800ms hard timeout; hub unreachable ⇒ still persisted, HTTP 202 "queued")
         ▼
-Caddy gateway (:81, Caddyfile) — reverse-proxies to :3000 by default, and to
-        any `?XTransformPort=<port>` query target (used by the dashboard's
-        WS client to reach the hub on :3003 through the same origin)
+Caddy (Docker, :80/:443, Caddyfile) — basic_auth for all web routes; `/socket.io/*` → iot-hub:3003
+        (adds the `x-hub-secret` header), everything else → frontend:3000. The ESP8266 bypasses
+        Caddy and connects to the hub directly on :3003 with `?token=<DEVICE_TOKEN>`.
 ```
+
+Hub sockets are authenticated in `io.use` (device token or `x-hub-secret`) and role-gated per event. Production runs via `docker-compose.yml` (migrate → frontend + iot-hub + caddy; simulator only under `--profile dev`); see README.md and `.env.example`. Socket.IO path is the default `/socket.io/`.
 
 The mini-services mirror the shared contract types locally (they're self-contained Bun projects, not part of the Next.js TS project) — keep `src/lib/iot-contracts.ts` and each `mini-services/*/index.ts`'s inline types in sync by hand when changing the wire format.
 
@@ -78,6 +86,6 @@ The mini-services mirror the shared contract types locally (they're self-contain
 - ESLint (`eslint.config.mjs`) deliberately disables most strictness (`no-explicit-any`, `no-unused-vars`, `exhaustive-deps`, etc.) on top of `eslint-config-next` — don't assume a lint pass implies type or dependency correctness.
 - `next.config.ts` sets `typescript.ignoreBuildErrors: true` and `reactStrictMode: false` — `bun run build` will succeed even with type errors; don't rely on the build to catch them.
 
-**Local DB note:** `.env`'s `DATABASE_URL` (`file:/home/z/my-project/db/custom.db`) is a leftover absolute path from the original Linux sandbox this project was scaffolded in, not this machine — check/update it before relying on `bun run db:push` or the mini-services connecting to the right SQLite file locally.
+**Local DB note:** `.env` is git-ignored — copy `.env.example`. An older local `.env` may hold a leftover absolute `DATABASE_URL`; check it before relying on `bun run db:push` or the mini-services connecting to the right SQLite file locally.
 
-**Deployment:** `Dockerfile` is a 3-stage Bun→Node build producing a standalone Next.js server (`ENV DATABASE_URL=file:/app/data/dev.db`, port 3000); `docker-compose.yml` runs just that container with a named volume for `/app/data`. This path does not currently start the mini-services — it's the Next.js app only.
+**Deployment:** `docker-compose.yml` runs `migrate` (one-shot `prisma db push`), `frontend` (internal :3000), `iot-hub` (public :3003, own `mini-services/iot-hub/Dockerfile`, built from the repo root so it can generate Prisma from the root schema) and `caddy` (:80/:443), all sharing the `iot-data` volume (`file:/app/data/dev.db`, WAL). `esp-simulator` is under `profiles: ["dev"]`.
